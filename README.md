@@ -30,7 +30,7 @@ composite-properties-predictor/
 Требуется Python 3.10 или выше.
 
 ```bash
-git clone https://github.com/<логин>/composite-properties-predictor.git
+git clone https://github.com/digger32/composite-properties-predictor.git
 cd composite-properties-predictor
 
 python -m venv venv
