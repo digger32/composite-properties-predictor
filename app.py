@@ -1,9 +1,9 @@
 """Streamlit-приложение для прогнозирования свойств композиционных материалов.
 
-Приложение загружает предварительно обученные модели из директории models/
-и предоставляет два независимых режима работы:
-    1) прогноз модуля упругости при растяжении и прочности при растяжении;
-    2) рекомендацию соотношения матрица-наполнитель.
+Приложение загружает обученные модели из директории models/ на основании
+описания моделей в файле metadata.json. Это позволяет автоматически
+подстраиваться под конкретную модель, выбранную скриптом train_models.py
+как лучшую по результатам 10-кратной кросс-валидации.
 
 Запуск:
     streamlit run app.py
@@ -21,10 +21,12 @@ import torch
 import torch.nn as nn
 
 MODELS_DIR = Path("models")
+METADATA_PATH = MODELS_DIR / "metadata.json"
 
 
+# --------------------------------------------------------------------------- #
 class MLPRatio(nn.Module):
-    """Архитектура MLP-2.4 должна соответствовать train_models.py."""
+    """Архитектура должна точно совпадать с train_models.py."""
 
     def __init__(self, n_in: int = 10) -> None:
         super().__init__()
@@ -38,39 +40,43 @@ class MLPRatio(nn.Module):
         return self.net(x)
 
 
+# --------------------------------------------------------------------------- #
 @st.cache_resource
 def load_artifacts():
-    """Загружает все модели один раз и кеширует до перезапуска процесса."""
-    if not MODELS_DIR.exists():
+    """Загружает все модели на основе описания в metadata.json."""
+    if not METADATA_PATH.exists():
         st.error(
-            "Директория `models/` не найдена. "
-            "Запустите `python train_models.py` для создания моделей."
+            f"Файл `{METADATA_PATH}` не найден. "
+            "Запустите `python train_models.py` для создания обученных моделей."
         )
         st.stop()
 
-    metadata = json.loads((MODELS_DIR / "metadata.json").read_text(encoding="utf-8"))
-    ridge_mod = joblib.load(MODELS_DIR / "ridge_modulus.joblib")
-    rf_str = joblib.load(MODELS_DIR / "rf_strength.joblib")
-    scaler_23 = joblib.load(MODELS_DIR / "scaler_23.joblib")
+    metadata = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+    files = metadata["artifact_filenames"]
+
+    scaler_23 = joblib.load(MODELS_DIR / files["scaler_23"])
+    best_modulus = joblib.load(MODELS_DIR / files["best_modulus"])
+    best_strength = joblib.load(MODELS_DIR / files["best_strength"])
 
     mlp = MLPRatio(n_in=len(metadata["features_24"]))
-    mlp.load_state_dict(torch.load(MODELS_DIR / "mlp_ratio.pt", map_location="cpu"))
+    mlp.load_state_dict(torch.load(MODELS_DIR / files["mlp_ratio"], map_location="cpu"))
     mlp.eval()
-    scaler_mlp_X = joblib.load(MODELS_DIR / "scaler_mlp_X.joblib")
-    scaler_mlp_y = joblib.load(MODELS_DIR / "scaler_mlp_y.joblib")
+    scaler_mlp_X = joblib.load(MODELS_DIR / files["scaler_mlp_X"])
+    scaler_mlp_y = joblib.load(MODELS_DIR / files["scaler_mlp_y"])
 
     return {
         "metadata": metadata,
-        "ridge_mod": ridge_mod,
-        "rf_str": rf_str,
         "scaler_23": scaler_23,
+        "best_modulus": best_modulus,
+        "best_strength": best_strength,
         "mlp": mlp,
         "scaler_mlp_X": scaler_mlp_X,
         "scaler_mlp_y": scaler_mlp_y,
     }
 
 
-# Реалистичные значения по умолчанию — средние по обучающей выборке
+# --------------------------------------------------------------------------- #
+# Средние значения по датасету — используются как разумные значения по умолчанию
 DEFAULTS = {
     "Соотношение матрица-наполнитель": 2.93,
     "Плотность, кг/м3": 1975.0,
@@ -101,7 +107,6 @@ INPUT_SPECS = {
 
 
 def render_input(feature: str, key_prefix: str):
-    """Отображает поле ввода, соответствующее типу признака."""
     spec = INPUT_SPECS[feature]
     key = f"{key_prefix}::{feature}"
     if "options" in spec:
@@ -114,18 +119,16 @@ def render_input(feature: str, key_prefix: str):
     )
 
 
-def show_model_disclaimer(metrics: dict, context: str) -> None:
-    """Отображает честное предупреждение о качестве модели."""
-    r2 = metrics.get("R2_test", metrics.get("R2_CV", 0))
-    if r2 < 0.1:
+def show_model_disclaimer(r2_test: float, context: str) -> None:
+    if r2_test < 0.1:
         st.warning(
-            f"⚠ **Ограничение модели ({context})**: R²(test) = {r2:+.3f}. "
+            f"⚠ **Ограничение модели ({context})**: R²(test) = {r2_test:+.3f}. "
             "Качество прогноза сопоставимо с предсказанием среднего значения "
             "обучающей выборки (baseline). Приложение носит демонстрационный "
-            "характер и **не предназначено** для использования при проектировании "
-            "реальных изделий без дополнительной валидации на расширенном датасете. "
-            "Подробное обоснование приведено в разделах 2.3 и 2.4 пояснительной "
-            "записки."
+            "характер и не предназначено для использования при проектировании "
+            "реальных изделий без дополнительной валидации на расширенном "
+            "датасете. Подробное обоснование приведено в разделах 2.3 и 2.4 "
+            "пояснительной записки."
         )
 
 
@@ -145,13 +148,13 @@ tab1, tab2 = st.tabs(
      "🎛 Рекомендация соотношения матрица-наполнитель"]
 )
 
-# ---------------------------- Вкладка 1 ------------------------------------ #
+# ------------------------------ Вкладка 1 ---------------------------------- #
 with tab1:
     st.subheader("Ввод технологических параметров")
     st.caption(
-        "Используются модели Ridge (для модуля упругости) и Random Forest "
-        "(для прочности), выбранные по результатам 10-кратной кросс-валидации "
-        "(подраздел 2.3 пояснительной записки)."
+        f"Модели (выбраны по R²(CV) в подразделе 2.3 пояснительной записки): "
+        f"**{metadata['best_model_modulus']}** — для модуля упругости; "
+        f"**{metadata['best_model_strength']}** — для прочности."
     )
 
     cols = st.columns(2)
@@ -161,21 +164,18 @@ with tab1:
             inputs_1[feat] = render_input(feat, "t1")
 
     left, right = st.columns([1, 1])
-    reset = left.button("↺ Сбросить значения", key="reset_t1")
-    if reset:
+    if left.button("↺ Сбросить значения", key="reset_t1"):
         for feat in metadata["features_23"]:
             st.session_state.pop(f"t1::{feat}", None)
         st.rerun()
 
-    predict = right.button(
-        "▶ Выполнить прогноз механических свойств", type="primary", key="predict_t1"
-    )
-    if predict:
+    if right.button("▶ Выполнить прогноз механических свойств",
+                    type="primary", key="predict_t1"):
         X_df = pd.DataFrame([[inputs_1[f] for f in metadata["features_23"]]],
                             columns=metadata["features_23"])
         X_scaled = art["scaler_23"].transform(X_df.values)
-        pred_mod = float(art["ridge_mod"].predict(X_scaled)[0])
-        pred_str = float(art["rf_str"].predict(X_scaled)[0])
+        pred_mod = float(art["best_modulus"].predict(X_scaled)[0])
+        pred_str = float(art["best_strength"].predict(X_scaled)[0])
 
         st.success("Прогноз выполнен.")
         m1, m2 = st.columns(2)
@@ -195,20 +195,32 @@ with tab1:
         )
 
         with st.expander("Метрики моделей (из metadata.json)"):
-            st.json(metadata["metrics"])
+            st.write("**Таблица 4 — модуль упругости при растяжении, ГПа**")
+            st.dataframe(pd.DataFrame(metadata["table_4_modulus"]),
+                         use_container_width=True)
+            st.write("**Таблица 5 — прочность при растяжении, МПа**")
+            st.dataframe(pd.DataFrame(metadata["table_5_strength"]),
+                         use_container_width=True)
 
-        show_model_disclaimer(metadata["metrics"]["modulus"],
-                              "модуль упругости")
-        show_model_disclaimer(metadata["metrics"]["strength"], "прочность")
+        # Извлечение R²(test) для предупреждений
+        t4 = pd.DataFrame(metadata["table_4_modulus"])
+        t5 = pd.DataFrame(metadata["table_5_strength"])
+        r2_mod = float(t4.loc[t4["Model"] == metadata["best_model_modulus"],
+                              "R2_test"].iloc[0])
+        r2_str = float(t5.loc[t5["Model"] == metadata["best_model_strength"],
+                              "R2_test"].iloc[0])
+        show_model_disclaimer(r2_mod, "модуль упругости")
+        show_model_disclaimer(r2_str, "прочность")
 
 
-# ---------------------------- Вкладка 2 ------------------------------------ #
+# ------------------------------ Вкладка 2 ---------------------------------- #
 with tab2:
     st.subheader("Рекомендация соотношения матрица-наполнитель")
     st.caption(
-        "Используется нейронная сеть MLP (PyTorch), обученная на 10 технологических "
-        "параметрах без утечки данных — модуль упругости и прочность при растяжении "
-        "из входов исключены (подраздел 2.4 пояснительной записки)."
+        "Используется нейронная сеть MLP (PyTorch), обученная на 10 "
+        "технологических параметрах без утечки данных — модуль упругости и "
+        "прочность при растяжении из входов исключены (подраздел 2.4 "
+        "пояснительной записки)."
     )
 
     cols = st.columns(2)
@@ -218,16 +230,12 @@ with tab2:
             inputs_2[feat] = render_input(feat, "t2")
 
     left, right = st.columns([1, 1])
-    reset = left.button("↺ Сбросить значения", key="reset_t2")
-    if reset:
+    if left.button("↺ Сбросить значения", key="reset_t2"):
         for feat in metadata["features_24"]:
             st.session_state.pop(f"t2::{feat}", None)
         st.rerun()
 
-    predict = right.button(
-        "▶ Получить рекомендацию", type="primary", key="predict_t2"
-    )
-    if predict:
+    if right.button("▶ Получить рекомендацию", type="primary", key="predict_t2"):
         X = np.array([[inputs_2[f] for f in metadata["features_24"]]],
                      dtype=np.float32)
         X_scaled = art["scaler_mlp_X"].transform(X).astype(np.float32)
@@ -239,16 +247,18 @@ with tab2:
         st.success("Рекомендация сформирована.")
         st.metric("Рекомендуемое соотношение матрица-наполнитель", f"{ratio:.3f}")
 
-        with st.expander("Метрики модели MLP (из metadata.json)"):
-            st.json(metadata["metrics"]["ratio"])
+        with st.expander("Метрики модели MLP-2.4 (из metadata.json)"):
+            st.json(metadata["mlp24"])
 
-        show_model_disclaimer(metadata["metrics"]["ratio"],
-                              "соотношение матрица-наполнитель")
+        r2_ratio = float(metadata["mlp24"]["metrics_mlp24"]["R2_test"])
+        show_model_disclaimer(r2_ratio, "соотношение матрица-наполнитель")
 
 
-# ---------------------------- Футер --------------------------------------- #
+# ------------------------------ Футер -------------------------------------- #
 st.divider()
 st.caption(
-    f"Версия обученных моделей: {metadata.get('version', '—')} | "
-    f"random_state = {metadata.get('seed', '—')}"
+    f"Версия моделей: {metadata.get('version', '—')} | "
+    f"random_state = {metadata.get('seed', '—')} | "
+    f"Датасет: {metadata.get('dataset_shape', ['—'])[0]} × "
+    f"{metadata.get('dataset_shape', ['—', '—'])[1]}"
 )
